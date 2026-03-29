@@ -26,7 +26,7 @@ done
 echo "PRIMARY elected."
 
 echo "Seeding stock data..."
-mongosh --host mongo1:27017 --eval '
+mongosh "mongodb://mongo1:27017,mongo2:27017,mongo3:27017/?replicaSet=rs0" --eval '
 db = db.getSiblingDB("stockdb");
 const stocks = [
   { name: "AAPL", price: 150 },

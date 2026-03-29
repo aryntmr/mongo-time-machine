@@ -1,3 +1,6 @@
+bootstrap:
+	bash bootstrap.sh $(ARGS)
+
 up:
 	docker compose up -d
 
@@ -15,3 +18,6 @@ simulate:
 
 install:
 	pip install -r requirements.txt
+
+query:
+	python query.py $(ARGS)
