@@ -24,6 +24,7 @@ try:
             name = doc.get("name", "N/A")
             price = doc.get("price")
             cluster_time = event.get("clusterTime")
+            wall_time = event.get("wallTime")
             token = event["_id"]["_data"]
 
             ts_str = bson_ts_to_datetime(cluster_time) if cluster_time else "N/A"
