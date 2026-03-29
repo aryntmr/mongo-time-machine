@@ -16,6 +16,7 @@ SA_EMAIL="${SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
 KEY_FILE="./service-account-key.json"
 DATASET="stock_history"
 TABLE="price_history"
+META_TABLE="pipeline_metadata"
 
 echo "==> Project: ${PROJECT_ID}"
 
@@ -58,6 +59,15 @@ bq mk --table \
   --schema='name:STRING,price:FLOAT64,timestamp:TIMESTAMP,operation_type:STRING,event_id:STRING,ingested_at:TIMESTAMP' \
   "${PROJECT_ID}:${DATASET}.${TABLE}" 2>/dev/null || echo "    (already exists, skipping)"
 
+# 6. Create pipeline_metadata table
+echo "==> Creating table ${DATASET}.${META_TABLE} ..."
+bq mk --table \
+  --time_partitioning_type=DAY \
+  --time_partitioning_field=started_at \
+  "${PROJECT_ID}:${DATASET}.${META_TABLE}" \
+  'pipeline_id:STRING,started_at:TIMESTAMP,snapshot_completed_at:TIMESTAMP,last_event_timestamp:TIMESTAMP,last_resume_token:STRING,status:STRING' \
+  2>/dev/null || echo "    (already exists, skipping)"
+
 echo ""
 echo "Done. Next steps:"
 echo "  1. Add to src/.env:"
@@ -65,5 +75,6 @@ echo "       GOOGLE_APPLICATION_CREDENTIALS=./service-account-key.json"
 echo "       GCP_PROJECT_ID=${PROJECT_ID}"
 echo "       BQ_DATASET=${DATASET}"
 echo "       BQ_TABLE=${TABLE}"
+echo "       BQ_METADATA_TABLE=${META_TABLE}"
 echo "  2. pip install -r requirements.txt"
 echo "  3. python listener.py"

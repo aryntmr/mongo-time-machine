@@ -21,3 +21,6 @@ install:
 
 query:
 	python query.py $(ARGS)
+
+validate:
+	python validate.py

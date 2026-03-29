@@ -15,7 +15,8 @@ BURSTY_MAX      = float(os.getenv("BURSTY_MAX", "3.0"))
 
 GCP_PROJECT_ID  = os.getenv("GCP_PROJECT_ID", "")
 BQ_DATASET      = os.getenv("BQ_DATASET", "stock_history")
-BQ_TABLE        = os.getenv("BQ_TABLE", "price_history")
+BQ_TABLE          = os.getenv("BQ_TABLE", "price_history")
+BQ_METADATA_TABLE = os.getenv("BQ_METADATA_TABLE", "pipeline_metadata")
 # GOOGLE_APPLICATION_CREDENTIALS is read automatically by the BigQuery client
 
 

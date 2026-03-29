@@ -7,9 +7,38 @@ import config
 
 bq_client = bigquery.Client(project=config.GCP_PROJECT_ID)
 TABLE = f"`{config.GCP_PROJECT_ID}.{config.BQ_DATASET}.{config.BQ_TABLE}`"
+META  = f"`{config.GCP_PROJECT_ID}.{config.BQ_DATASET}.{config.BQ_METADATA_TABLE}`"
+
+
+def check_data_coverage(target_time: datetime) -> None:
+    """Warn if target_time predates the earliest data we have captured.
+
+    Queries pipeline_metadata for the most recent completed snapshot time.
+    If the requested timestamp falls before that, the result may be incomplete
+    (prices that existed before the pipeline started are not in BigQuery).
+    """
+    sql = f"""
+        SELECT snapshot_completed_at, status
+        FROM {META}
+        WHERE snapshot_completed_at IS NOT NULL
+        ORDER BY snapshot_completed_at ASC
+        LIMIT 1
+    """
+    rows = list(bq_client.query(sql).result())
+    if not rows:
+        print("WARNING: No pipeline metadata found. Has the listener run yet?")
+        return
+    snap_time = rows[0]["snapshot_completed_at"]
+    if snap_time and target_time < snap_time:
+        print(
+            f"WARNING: Requested time {target_time.strftime('%Y-%m-%d %H:%M:%S UTC')} "
+            f"is before earliest data ({snap_time.strftime('%Y-%m-%d %H:%M:%S UTC')}). "
+            f"Result may be incomplete."
+        )
 
 
 def point_in_time(name: str, target_time: datetime) -> None:
+    check_data_coverage(target_time)
     sql = f"""
         SELECT price, timestamp
         FROM {TABLE}
@@ -54,6 +83,7 @@ def latest(name: str) -> None:
 
 
 def all_at_time(target_time: datetime) -> None:
+    check_data_coverage(target_time)
     sql = f"""
         SELECT name, price, timestamp
         FROM {TABLE}
