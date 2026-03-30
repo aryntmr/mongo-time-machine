@@ -2,51 +2,29 @@
 
 ## What This Is
 
-A CDC pipeline. `simulator.py` writes random stock price updates to a MongoDB replica set. `listener.py` takes a baseline snapshot of MongoDB on startup (or resumes from a saved token), then opens a change stream and publishes every event to Google Cloud Pub/Sub. `subscriber.py` pulls events from Pub/Sub in micro-batches and writes them to BigQuery. `query.py` answers point-in-time price queries against BigQuery. `validate.py` verifies the pipeline hasn't missed any events by comparing current MongoDB state against BigQuery history.
+MongoDB → Pub/Sub → BigQuery CDC pipeline with point-in-time stock price queries.
 
 ---
 
 ## Architecture
 
 ```
-simulator.py
-    │
-    │  update_one()
-    ▼
-MongoDB 3-node replica set (Docker)
-    │
-    ├─── on startup (no saved token): full collection read → Pub/Sub (snapshot events)
-    │    on startup (saved token): resume change stream from token (no snapshot)
-    │
-    └─── persistent change stream
-              │
-              │  publisher.publish() — one message per event
-              ▼
-         Google Cloud Pub/Sub — price-events topic
-              │
-              │  pull subscription (ack deadline 60s, 7-day retention)
-              │  dead letter topic after 5 failed deliveries
-              ▼
-         subscriber.py — micro-batch writer
-              │
-              │  insert_rows_json() — up to 500 rows or 2 seconds
-              ▼
-         BigQuery — price_history
+simulator.py  →  MongoDB replica set (Docker)
+                      │
+                      ├─ no saved token: snapshot → Pub/Sub, then change stream
+                      └─ saved token: resume change stream from token
+                                │
+                           Pub/Sub (60s ack deadline, 7-day retention, dead letter after 5 fails)
+                                │
+                          subscriber.py (micro-batch: 500 msgs or 2s → insert_rows_json)
+                                │
+                           BigQuery — price_history (deduped at query time by event_id)
 
-listener.py
-    ├── metadata rows ──→ BigQuery — pipeline_metadata (direct writes, unchanged)
-    └── resume token ──→ GCS bucket (saved every 10s, loaded on startup)
+listener.py  →  pipeline_metadata (direct BQ writes)
+            →  resume token (GCS, saved every 10s + on shutdown)
 
-BigQuery — price_history
-    │
-    │  parameterized SQL (point-in-time, latest, all-at-time)
-    ▼
-query.py  ←──  pre-check against pipeline_metadata (warn if query predates first snapshot)
-
-validate.py
-    ├── reads current prices from MongoDB
-    ├── reads latest prices from BigQuery
-    └── compares: OK / MISSING / MISMATCH per stock
+query.py  →  price_history (point-in-time, --latest, --all-at-time) + metadata pre-check
+validate.py  →  MongoDB vs BigQuery comparison (OK / MISSING / MISMATCH)
 ```
 
 ---
@@ -55,21 +33,20 @@ validate.py
 
 ```
 src/
-├── config.py              # all config vars + get_mongo_client()
-├── simulator.py           # writes random price updates to MongoDB in a loop
-├── listener.py            # snapshot + change stream → Pub/Sub; writes pipeline_metadata; saves resume token to GCS
-├── subscriber.py          # pulls from Pub/Sub, micro-batches into BigQuery price_history
-├── query.py               # CLI: point-in-time, --latest, --all-at-time queries (+ metadata pre-check)
-├── validate.py            # compares current MongoDB state vs BigQuery history (OK/MISSING/MISMATCH)
-├── bootstrap.sh           # one-command GCP + Python setup (run once)
-├── setup_gcp.sh           # provisions service account, IAM, BQ dataset + tables, Pub/Sub, GCS bucket
-├── docker-compose.yml     # 3-node MongoDB replica set (mongo1/2/3)
-├── mongo-init/
-│   └── init.sh            # rs.initiate() + seeds 5 stocks, runs once on first up
-├── requirements.txt       # pymongo, python-dotenv, google-cloud-bigquery, google-cloud-pubsub, google-cloud-storage
-├── .env.example           # config template — committed
-├── .env                   # real values — never commit
-└── Makefile               # shortcuts: make up/down/listen/subscribe/simulate/query/validate/bootstrap
+├── config.py          # env vars + get_mongo_client()
+├── simulator.py       # random price updates to MongoDB
+├── listener.py        # snapshot + change stream → Pub/Sub; metadata → BQ; token → GCS
+├── subscriber.py      # Pub/Sub → BigQuery micro-batch writer
+├── query.py           # CLI: --latest, --time, --all-at-time (with dedup CTE + retry)
+├── validate.py        # MongoDB vs BigQuery integrity check
+├── bootstrap.sh       # one-command GCP + Python setup
+├── setup_gcp.sh       # provisions IAM, BQ, Pub/Sub, GCS
+├── docker-compose.yml # 3-node MongoDB replica set
+├── mongo-init/init.sh # rs.initiate() + seeds 5 stocks
+├── requirements.txt
+├── .env.example       # committed template
+├── .env               # never commit
+└── Makefile
 ```
 
 ---
@@ -77,56 +54,60 @@ src/
 ## BigQuery Tables
 
 ### `price_history`
-Every price event ever recorded. Partitioned by `DATE(timestamp)`, clustered by `name`.
+Partitioned by `DATE(timestamp)`, clustered by `name`.
 
-| Column | Type | Description |
-|--------|------|-------------|
-| `name` | STRING | Stock name |
-| `price` | FLOAT64 | Price at time of change |
-| `timestamp` | TIMESTAMP | MongoDB `clusterTime` — seconds precision, UTC |
+| Column | Type | Notes |
+|--------|------|-------|
+| `name` | STRING | Stock ticker |
+| `price` | FLOAT64 | Price at event time |
+| `timestamp` | TIMESTAMP | MongoDB `clusterTime` — seconds precision |
 | `operation_type` | STRING | `snapshot` / `update` / `insert` / `replace` |
-| `event_id` | STRING | Resume token (change events) or `snapshot-{pipeline_id}-{_id}` (snapshots) |
-| `ingested_at` | TIMESTAMP | When the pipeline wrote this row |
+| `event_id` | STRING | Resume token, or `snapshot-{pipeline_id}-{_id}` |
+| `ingested_at` | TIMESTAMP | Wall clock when subscriber wrote the row |
 
 ### `pipeline_metadata`
-One row appended per lifecycle event. Partitioned by `DATE(started_at)`.
+Append-only. Partitioned by `DATE(started_at)`. Read with `ORDER BY ... DESC LIMIT 1`.
 
-| Column | Type | Description |
-|--------|------|-------------|
-| `pipeline_id` | STRING | UUID generated fresh on each `listener.py` start |
-| `started_at` | TIMESTAMP | When this listener process started |
-| `snapshot_completed_at` | TIMESTAMP | Cluster time of the baseline snapshot |
-| `last_event_timestamp` | TIMESTAMP | Cluster time of the most recently processed event |
-| `last_resume_token` | STRING | Resume token of the most recently processed event |
+| Column | Type | Notes |
+|--------|------|-------|
+| `pipeline_id` | STRING | UUID per listener run |
+| `started_at` | TIMESTAMP | Process start time |
+| `snapshot_completed_at` | TIMESTAMP | Cluster time of baseline snapshot |
+| `last_event_timestamp` | TIMESTAMP | Cluster time of last processed event |
+| `last_resume_token` | STRING | Resume token of last processed event |
 | `status` | STRING | `running` / `stopped` |
 
 ---
 
 ## Key Things to Know
 
-**Always use `config.get_mongo_client()`** — never instantiate `pymongo.MongoClient` directly. On macOS, `host.docker.internal` is often absent from `/etc/hosts`, so the function does a DNS check first and falls back to scanning `localhost:27017/18/19` with `directConnection=true` to find the current PRIMARY.
+**`config.get_mongo_client()`** — always use this, never `pymongo.MongoClient` directly. On macOS, `host.docker.internal` may be missing; the function falls back to scanning `localhost:27017/18/19` with `directConnection=true` to find the PRIMARY.
 
-**PRIMARY is non-deterministic** — any of the 3 nodes can win the election. Never assume port 27017 is the primary.
+**PRIMARY is non-deterministic** — any of the 3 nodes can win election. Never assume port 27017 is primary.
 
-**Snapshot before change stream** — on first startup (no saved resume token), `listener.py` pings MongoDB to capture the current cluster time, reads all documents, and publishes them to Pub/Sub with `operation_type="snapshot"`. The change stream then opens with `startAtOperationTime` set to that cluster time. This eliminates the gap between the snapshot read and the first change event. Events that overlap (same second as the snapshot) appear as harmless duplicates — V4 deduplication resolves them.
+**Snapshot gap elimination** — listener pings MongoDB to capture `clusterTime` *before* reading documents, then opens the change stream with `startAtOperationTime` set to that clock. Writes during the scan are caught by the stream. Overlap events (same second) are harmless duplicates — deduped at query time.
 
-**Resume token persistence** — the listener saves the latest change stream resume token to a GCS file every 10 seconds. On restart, if a saved token exists, the listener skips the snapshot and resumes the change stream from that token. If the token is stale (MongoDB oplog rolled past it), the listener falls back to a fresh snapshot. The token is also saved on graceful shutdown (Ctrl+C / `finally` block).
+**Resume token** — saved to GCS every 10s and on graceful shutdown. On restart: token exists → skip snapshot, resume stream. Token stale (oplog rolled past it) → `OperationFailure` caught → delete token → fresh snapshot.
 
-**Pub/Sub does not guarantee ordering** — this doesn't affect correctness because BigQuery queries use `ORDER BY timestamp` (MongoDB `clusterTime`) for ordering, not insertion order. The subscriber writes rows in whatever order they arrive; the query layer handles sequencing.
+**Token update ordering** — `state["last_token"] = token` runs unconditionally for every event before the publish block. Prevents a Ctrl+C race where publish succeeds but the token assignment is skipped.
 
-**Subscriber micro-batching** — `subscriber.py` collects up to 500 messages or waits 2 seconds (whichever comes first), then writes the batch to BigQuery in one `insert_rows_json` call. Messages are acked only after a successful write; nacked on failure so Pub/Sub redelivers them. After 5 failed deliveries, messages go to the dead letter topic.
+**Pub/Sub ordering not guaranteed** — correctness relies on `ORDER BY timestamp` (MongoDB `clusterTime`), not insertion order.
 
-**`clusterTime` is seconds + ordinal** — `.time` is Unix seconds, `.inc` is an ordering counter within that second, not a fractional second. Only `.time` is stored in BigQuery's `timestamp` column. Two events within the same second share the same timestamp value.
+**Micro-batching** — up to 500 msgs or 2s, whichever first. Ack after successful BQ write; nack on failure → Pub/Sub redelivers. After 5 failures → dead letter topic.
 
-**`fullDocument.price` can have a race condition** — `updateLookup` snapshots the document after the event fires, so a rapid second update can contaminate it. The atomic source is `updateDescription.updatedFields["price"]` for update operations. The listener uses this for `update` events and falls back to `fullDocument["price"]` for insert/replace.
+**Deduplication** — duplicates are allowed into `price_history` (Pub/Sub at-least-once + snapshot/stream overlap). All queries in `query.py` use a CTE: `ROW_NUMBER() OVER (PARTITION BY event_id ORDER BY ingested_at ASC) = 1` to collapse them at read time. Write-time dedup is unreliable due to BQ's 30s streaming buffer delay.
 
-**`pipeline_metadata` is append-only** — BigQuery streaming inserts cannot update rows. Each status change is a new row. To read current state, always query with `ORDER BY ... DESC LIMIT 1`. Metadata is written directly by the listener (not through Pub/Sub) on: process start, snapshot completion, first event, every 10 events, and process exit (via `finally` — fires on both clean shutdown and crashes, but not on `kill -9`).
+**`clusterTime` precision** — `.time` = Unix seconds, `.inc` = ordinal within that second. Only `.time` stored in BQ. Multiple events in the same second share the same timestamp.
 
-**`check_data_coverage` uses the earliest snapshot** — `query.py` warns if a requested timestamp is before the very first snapshot ever recorded across all pipeline runs. It does NOT detect gaps between runs (e.g., pipeline was down for 5 minutes).
+**`updatedFields` over `fullDocument`** — for `update` ops, use `updateDescription.updatedFields["price"]`. `fullDocument` comes from `updateLookup` which snapshots the doc *after* the event — a rapid second update can contaminate it.
 
-**BigQuery streaming insert delay** — rows written via `insert_rows_json()` may take up to 30 seconds before they appear in query results. Wait before querying after stopping the subscriber.
+**`pipeline_metadata` is append-only** — written on: process start, snapshot complete, first event, every 10 events, process exit (`finally` — not on `kill -9`).
 
-**`GOOGLE_APPLICATION_CREDENTIALS`** is read automatically by the BigQuery and GCS clients from the environment — no explicit config needed in Python.
+**`check_data_coverage`** — warns if query time predates the earliest snapshot. Does not detect mid-run gaps. Returns the snapshot datetime for use in "no data available" messages.
+
+**BQ streaming delay** — up to 30s before streamed rows appear in queries. Wait before querying after stopping the subscriber.
+
+**`GOOGLE_APPLICATION_CREDENTIALS`** — read automatically by BQ and GCS clients. No explicit config needed in Python.
 
 ---
 
@@ -139,17 +120,17 @@ One row appended per lifecycle event. Partitioned by `DATE(started_at)`.
 | `COLLECTION` | `stocks` | Collection |
 | `UPDATE_INTERVAL` | `1.0` | Seconds between simulator updates |
 | `BURSTY_MODE` | `false` | Random sleep if true |
-| `BURSTY_MIN` | `0.1` | Bursty mode min sleep (seconds) |
-| `BURSTY_MAX` | `3.0` | Bursty mode max sleep (seconds) |
-| `GOOGLE_APPLICATION_CREDENTIALS` | `./service-account-key.json` | Path to GCP service account key |
+| `BURSTY_MIN` | `0.1` | Bursty min sleep (s) |
+| `BURSTY_MAX` | `3.0` | Bursty max sleep (s) |
+| `GOOGLE_APPLICATION_CREDENTIALS` | `./service-account-key.json` | GCP service account key path |
 | `GCP_PROJECT_ID` | — | GCP project ID |
 | `BQ_DATASET` | `stock_history` | BigQuery dataset |
-| `BQ_TABLE` | `price_history` | BigQuery table |
-| `BQ_METADATA_TABLE` | `pipeline_metadata` | BigQuery pipeline health table |
-| `PUBSUB_TOPIC` | `price-events` | Pub/Sub topic for price events |
+| `BQ_TABLE` | `price_history` | Price history table |
+| `BQ_METADATA_TABLE` | `pipeline_metadata` | Pipeline health table |
+| `PUBSUB_TOPIC` | `price-events` | Pub/Sub topic |
 | `PUBSUB_SUBSCRIPTION` | `price-events-sub` | Pub/Sub pull subscription |
-| `GCS_BUCKET` | — | GCS bucket for resume token storage |
-| `GCS_RESUME_TOKEN_PATH` | `resume_token.txt` | Object path within the GCS bucket |
+| `GCS_BUCKET` | — | GCS bucket for resume token |
+| `GCS_RESUME_TOKEN_PATH` | `resume_token.txt` | Object path within bucket |
 
 ---
 
@@ -158,38 +139,32 @@ One row appended per lifecycle event. Partitioned by `DATE(started_at)`.
 ```bash
 cd src
 
-# 1. first-time setup (GCP + venv + deps)
-python3 -m venv .venv
-source .venv/bin/activate
+# First-time setup
+python3 -m venv .venv && source .venv/bin/activate
 gcloud auth login
 bash bootstrap.sh <gcp-project-id>
 
-# 2. start the replica set
+# Start MongoDB replica set
 docker compose up -d
 docker compose logs mongo-setup   # wait for: PRIMARY elected + Seeded 5 stocks
 
-# 3. terminal 1 — subscriber (Pub/Sub → BigQuery)
+# Terminal 1 — subscriber (start before listener)
 source .venv/bin/activate && python subscriber.py
 
-# 4. terminal 2 — listener (MongoDB → Pub/Sub)
-#    first run: takes baseline snapshot, publishes to Pub/Sub
-#    subsequent runs: resumes from saved token (no snapshot)
+# Terminal 2 — listener
 source .venv/bin/activate && python listener.py
 
-# 5. terminal 3 — simulator
+# Terminal 3 — simulator
 source .venv/bin/activate && python simulator.py
 
-# 6. wait ~30 seconds after stopping subscriber before querying
-#    (BigQuery streaming insert delay)
-
-# 7. query BigQuery
+# Query (wait ~30s after stopping subscriber for BQ streaming delay)
 python query.py --name AAPL --latest
 python query.py --name AAPL --time "2026-03-29 12:00:00"
 python query.py --all-at-time "2026-03-29 12:00:00"
 
-# 8. validate pipeline integrity (run after subscriber has been up and data has settled)
-python validate.py   # exit 0 = all OK, exit 1 = MISSING or MISMATCH detected
+# Validate
+python validate.py   # exit 0 = OK, exit 1 = MISSING or MISMATCH
 
-# tear down
+# Tear down
 docker compose down -v
 ```

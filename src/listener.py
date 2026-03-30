@@ -210,6 +210,12 @@ def _consume_stream(stream, snapshot_time, pipeline_id, started_at, state):
         cluster_time = event.get("clusterTime")
         token = event["_id"]["_data"]
 
+        # Always advance the resume position for every event we receive,
+        # regardless of whether we publish it. This prevents a Ctrl+C race
+        # where publish_event() succeeds but the token update is skipped
+        # (causing that event to be re-published on the next restart).
+        state["last_token"] = token
+
         ts_str = bson_ts_to_display(cluster_time) if cluster_time else "N/A"
         price_str = f"{price:.2f}" if isinstance(price, (int, float)) else "N/A"
         print(f"[{ts_str}]  {op.upper():<8}  name={name:<5}  price={price_str}  token={token}")
@@ -227,7 +233,6 @@ def _consume_stream(stream, snapshot_time, pipeline_id, started_at, state):
             print(f"  [PUBSUB OK]")
 
             state["last_event_ts"] = bson_ts_to_iso(cluster_time)
-            state["last_token"] = token
             event_count += 1
 
             # Persist pipeline health on first event, then every 10
@@ -241,10 +246,11 @@ def _consume_stream(stream, snapshot_time, pipeline_id, started_at, state):
                     status="running",
                 )
 
-            # Save resume token to GCS every 10 seconds
-            if time.monotonic() - last_token_save_time >= 10:
-                save_resume_token(state["last_token"])
-                last_token_save_time = time.monotonic()
+        # Save resume token to GCS every 10 seconds (outside the publish block
+        # so the cursor position is persisted even for events we skip).
+        if time.monotonic() - last_token_save_time >= 10:
+            save_resume_token(state["last_token"])
+            last_token_save_time = time.monotonic()
 
 
 def main() -> None:

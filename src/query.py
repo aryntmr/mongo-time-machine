@@ -1,4 +1,29 @@
+"""query.py -- Point-in-time stock price queries against BigQuery.
+
+V4 additions:
+- All price_history reads go through a deduplication CTE that keeps only
+  the first-ingested row per event_id. This handles two sources of duplicates:
+    1. Snapshot/change-stream overlap: listener captures cluster time, reads all
+       docs, then opens the change stream at startAtOperationTime. Any write
+       that happened in the same second appears in both snapshot and stream rows.
+    2. Pub/Sub at-least-once redelivery: if the subscriber crashes after writing
+       to BigQuery but before acking, messages are redelivered and written again.
+
+Deduplication strategy — query-time (not write-time):
+  The alternative (write-time dedup) would check whether an event_id already
+  exists in BigQuery before inserting. This is unreliable because BigQuery
+  streaming inserts have up to a 30-second buffer delay — a freshly written row
+  won't appear in queries immediately, so the "does it exist?" check can miss it
+  and produce duplicates anyway. An in-memory set in the subscriber handles hot
+  duplicates within one process lifetime but is lost on restart.
+
+  Query-time dedup via ROW_NUMBER() is idempotent, stateless, and handles all
+  sources of duplication uniformly. On a clean table (no real duplicates) every
+  row has rn=1 and the filter costs nothing extra.
+"""
+
 import argparse
+import time
 from datetime import datetime, timezone
 
 from google.cloud import bigquery
@@ -10,24 +35,39 @@ TABLE = f"`{config.GCP_PROJECT_ID}.{config.BQ_DATASET}.{config.BQ_TABLE}`"
 META  = f"`{config.GCP_PROJECT_ID}.{config.BQ_DATASET}.{config.BQ_METADATA_TABLE}`"
 
 
-def check_data_coverage(target_time: datetime) -> None:
-    """Warn if target_time predates the earliest data we have captured.
+def bq_query_with_retry(sql: str, job_config=None, max_attempts: int = 5) -> list:
+    """Run a BigQuery query, retrying on transient failures with exponential backoff.
 
-    Queries pipeline_metadata for the most recent completed snapshot time.
-    If the requested timestamp falls before that, the result may be incomplete
-    (prices that existed before the pipeline started are not in BigQuery).
+    Raises the last exception if all attempts fail.
+    """
+    for attempt in range(max_attempts):
+        try:
+            return list(bq_client.query(sql, job_config=job_config).result())
+        except Exception as e:
+            if attempt == max_attempts - 1:
+                raise
+            wait = 2 ** attempt
+            print(f"[BQ RETRY] Attempt {attempt + 1}/{max_attempts} failed: {e}. Retrying in {wait}s ...")
+            time.sleep(wait)
+
+
+def check_data_coverage(target_time: datetime) -> datetime | None:
+    """Warn if target_time predates the earliest snapshot, and return that snapshot time.
+
+    Returns the earliest snapshot_completed_at datetime (UTC-aware), or None if
+    no metadata is available yet.
     """
     sql = f"""
-        SELECT snapshot_completed_at, status
+        SELECT snapshot_completed_at
         FROM {META}
         WHERE snapshot_completed_at IS NOT NULL
         ORDER BY snapshot_completed_at ASC
         LIMIT 1
     """
-    rows = list(bq_client.query(sql).result())
+    rows = bq_query_with_retry(sql)
     if not rows:
         print("WARNING: No pipeline metadata found. Has the listener run yet?")
-        return
+        return None
     snap_time = rows[0]["snapshot_completed_at"]
     if snap_time and target_time < snap_time:
         print(
@@ -35,15 +75,31 @@ def check_data_coverage(target_time: datetime) -> None:
             f"is before earliest data ({snap_time.strftime('%Y-%m-%d %H:%M:%S UTC')}). "
             f"Result may be incomplete."
         )
+    return snap_time
 
 
 def point_in_time(name: str, target_time: datetime) -> None:
-    check_data_coverage(target_time)
+    snap_time = check_data_coverage(target_time)
+
+    # Dedup CTE: keep one row per event_id (first ingested wins), then find
+    # the most recent price for this stock at or before the target time.
     sql = f"""
+        WITH deduped AS (
+            SELECT * EXCEPT (rn)
+            FROM (
+                SELECT *,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY event_id
+                           ORDER BY ingested_at ASC
+                       ) AS rn
+                FROM {TABLE}
+                WHERE name = @name
+            )
+            WHERE rn = 1
+        )
         SELECT price, timestamp
-        FROM {TABLE}
-        WHERE name = @name
-          AND timestamp <= @target_time
+        FROM deduped
+        WHERE timestamp <= @target_time
         ORDER BY timestamp DESC
         LIMIT 1
     """
@@ -53,9 +109,16 @@ def point_in_time(name: str, target_time: datetime) -> None:
             bigquery.ScalarQueryParameter("target_time", "TIMESTAMP", target_time),
         ]
     )
-    rows = list(bq_client.query(sql, job_config=job_config).result())
+    rows = bq_query_with_retry(sql, job_config)
     if not rows:
-        print(f"No data found for {name} at or before {target_time.strftime('%Y-%m-%d %H:%M:%S UTC')}")
+        if snap_time and target_time < snap_time:
+            print(
+                f"No data available for {name} before "
+                f"{snap_time.strftime('%Y-%m-%d %H:%M:%S UTC')}. "
+                f"Pipeline data starts at {snap_time.strftime('%Y-%m-%d %H:%M:%S UTC')}."
+            )
+        else:
+            print(f"Stock '{name}' not found.")
         return
     row = rows[0]
     print(f"{name}  price={row.price:.2f}  as of {row.timestamp.strftime('%Y-%m-%d %H:%M:%S UTC')}")
@@ -63,9 +126,21 @@ def point_in_time(name: str, target_time: datetime) -> None:
 
 def latest(name: str) -> None:
     sql = f"""
+        WITH deduped AS (
+            SELECT * EXCEPT (rn)
+            FROM (
+                SELECT *,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY event_id
+                           ORDER BY ingested_at ASC
+                       ) AS rn
+                FROM {TABLE}
+                WHERE name = @name
+            )
+            WHERE rn = 1
+        )
         SELECT price, timestamp
-        FROM {TABLE}
-        WHERE name = @name
+        FROM deduped
         ORDER BY timestamp DESC
         LIMIT 1
     """
@@ -74,9 +149,9 @@ def latest(name: str) -> None:
             bigquery.ScalarQueryParameter("name", "STRING", name),
         ]
     )
-    rows = list(bq_client.query(sql, job_config=job_config).result())
+    rows = bq_query_with_retry(sql, job_config)
     if not rows:
-        print(f"No data found for {name}")
+        print(f"Stock '{name}' not found.")
         return
     row = rows[0]
     print(f"{name}  price={row.price:.2f}  as of {row.timestamp.strftime('%Y-%m-%d %H:%M:%S UTC')}")
@@ -84,10 +159,27 @@ def latest(name: str) -> None:
 
 def all_at_time(target_time: datetime) -> None:
     check_data_coverage(target_time)
+
+    # Two-level windowing:
+    #   Inner CTE (deduped): collapse duplicate event_ids, keeping first ingested.
+    #   QUALIFY clause: for each stock name, keep only the most recent price
+    #                   at or before target_time.
     sql = f"""
+        WITH deduped AS (
+            SELECT * EXCEPT (rn)
+            FROM (
+                SELECT *,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY event_id
+                           ORDER BY ingested_at ASC
+                       ) AS rn
+                FROM {TABLE}
+                WHERE timestamp <= @target_time
+            )
+            WHERE rn = 1
+        )
         SELECT name, price, timestamp
-        FROM {TABLE}
-        WHERE timestamp <= @target_time
+        FROM deduped
         QUALIFY ROW_NUMBER() OVER (PARTITION BY name ORDER BY timestamp DESC) = 1
         ORDER BY name
     """
@@ -96,9 +188,9 @@ def all_at_time(target_time: datetime) -> None:
             bigquery.ScalarQueryParameter("target_time", "TIMESTAMP", target_time),
         ]
     )
-    rows = list(bq_client.query(sql, job_config=job_config).result())
+    rows = bq_query_with_retry(sql, job_config)
     if not rows:
-        print(f"No data found at or before {target_time.strftime('%Y-%m-%d %H:%M:%S UTC')}")
+        print(f"No stocks found at or before {target_time.strftime('%Y-%m-%d %H:%M:%S UTC')}.")
         return
     for row in rows:
         print(f"{row.name:<6}  price={row.price:.2f}  as of {row.timestamp.strftime('%Y-%m-%d %H:%M:%S UTC')}")
