@@ -1,0 +1,16 @@
+.env
+*.json
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+.git/
+mongo-init/
+config.yaml
+docker-compose.yml
+simulator.py
+query.py
+validate.py
+bootstrap.sh
+setup_gcp.sh
+Makefile

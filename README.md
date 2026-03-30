@@ -1,22 +1,22 @@
 # Vali Health CDC Pipeline
 
-MongoDB → Pub/Sub → BigQuery change-data-capture pipeline with point-in-time stock price queries. Captures every price update via MongoDB change streams, fans out through Pub/Sub, and lands in BigQuery for millisecond-precision historical queries.
+MongoDB → Pub/Sub → BigQuery change-data-capture pipeline with point-in-time stock price queries. Captures every price update via MongoDB change streams, fans out through Pub/Sub, and lands in BigQuery for historical queries.
 
 ---
 
 ## Architecture
 
 ```
-simulator.py  →  MongoDB replica set (Docker)
-                      │
-                      ├─ no saved token: full snapshot → Pub/Sub, then change stream
-                      └─ saved token: resume change stream from token
-                                │
-                           Pub/Sub (60s ack deadline · 7-day retention · dead letter after 5 fails)
-                                │
-                          subscriber.py  (micro-batch: 500 msgs or 2s → insert_rows_json)
-                                │
-                           BigQuery — price_history  (deduped at query time by event_id)
+[Your app / simulator.py]  →  MongoDB replica set
+                                      │
+                          listener.py (Docker container, local machine)
+                                      │   saves resume token → GCS
+                                   Pub/Sub
+                          (60s ack deadline · 7-day retention · dead letter after 5 fails)
+                                      │
+                          subscriber.py (Cloud Run, min 1 instance)
+                                      │
+                           BigQuery — price_history (deduped at query time by event_id)
 
 listener.py  →  pipeline_metadata (direct BQ writes)
             →  resume token (GCS, saved every 10s + on shutdown)
@@ -26,83 +26,109 @@ listener.py  →  pipeline_metadata (direct BQ writes)
 
 ## Prerequisites
 
-- [gcloud CLI](https://cloud.google.com/sdk/docs/install)
-- [Terraform](https://developer.hashicorp.com/terraform/install) >= 1.0
-- [Docker + Docker Compose](https://docs.docker.com/get-docker/)
-- Python 3.9+
+- [Docker Desktop](https://docs.docker.com/get-docker/) — the only thing you need to install
 - A GCP project with **billing enabled**
+- A MongoDB **replica set** (standalone MongoDB does not support change streams)
+
+All other tools (gcloud CLI, Terraform, Python) run inside the tools container — nothing else to install.
 
 ---
 
-## Quick Start
+## Setup
 
-**1. Authenticate**
-```bash
-gcloud auth login
-gcloud auth application-default login
-```
-
-**2. Configure**
+**1. Configure**
 ```bash
 cd src
 cp config.yaml.example config.yaml
-# Edit config.yaml — fill in gcp.project_id and mongodb fields
 ```
+Edit `config.yaml` — fill in your GCP project ID and MongoDB connection details.
 
-**3. Bootstrap** (provisions all GCP resources + populates `.env`)
+**2. Bootstrap** — provisions all GCP infrastructure and writes `.env`
 ```bash
-python3 -m venv .venv && source .venv/bin/activate
-bash bootstrap.sh
+make bootstrap
 ```
+Enables GCP APIs, runs Terraform (BigQuery, Pub/Sub, GCS, Artifact Registry, Cloud Run, service account), and writes `service-account-key.json`. Will prompt for browser-based Google login on first run or when switching accounts.
 
-**4. Start MongoDB**
+**3. Deploy subscriber to Cloud Run**
+```bash
+make deploy
+```
+Builds the subscriber image for `linux/amd64`, pushes to Artifact Registry, and deploys to Cloud Run with min 1 instance so it's always ready to pull from Pub/Sub.
+
+**4. Start local MongoDB**
 ```bash
 make up
-docker compose logs mongo-setup   # wait for: PRIMARY elected + Seeded 5 stocks
+```
+Starts a 3-node MongoDB replica set in Docker. Skip this step if you're connecting to your own MongoDB (Atlas or on-prem) — set `MONGO_URI` in `config.yaml` instead.
+
+**5. Start the listener**
+```bash
+make listener-up
+```
+Starts the listener as a Docker container. It takes a baseline snapshot of your MongoDB collection, then watches the change stream and publishes every update to Pub/Sub. The Cloud Run subscriber picks them up and writes to BigQuery.
+
+**6. Verify** (wait ~30s for BigQuery streaming buffer to settle)
+```bash
+make validate                              # MongoDB == BigQuery?
+make query ARGS='--name AAPL --latest'     # latest price
+make query ARGS='--name AAPL --time "2026-03-29 12:05:30"'   # price at a point in time
+make query ARGS='--all-at-time "2026-03-29 12:05:30"'        # all stocks at a point in time
 ```
 
-**5. Run the pipeline** (three separate terminals, all in `src/` with venv active)
-```bash
-make subscribe   # terminal 1 — Pub/Sub → BigQuery
-make listen      # terminal 2 — MongoDB CDC → Pub/Sub
-make simulate    # terminal 3 — price updates
+---
+
+## Connecting to Your Own MongoDB
+
+Set `mongodb.connection_string` in `config.yaml` before running `make bootstrap`:
+
+```yaml
+mongodb:
+  connection_string: mongodb+srv://<user>:<pass>@<cluster>.mongodb.net/
+  database: <your-database>
+  collection: <your-collection>
 ```
+
+**Requirements:**
+- MongoDB must be a **replica set** — change streams do not work on standalone instances
+- The listener container connects outbound from your machine — no inbound firewall rules needed
+- For MongoDB Atlas: whitelist your IP (or `0.0.0.0/0` for demos) in Atlas Network Access
+
+---
+
+## Running the Simulator (optional, for testing)
+
+```bash
+make simulate
+```
+Generates random price updates to the local Docker MongoDB. Not needed when connected to a real database.
 
 ---
 
 ## Querying
 
-Wait ~30s after starting the pipeline for BigQuery's streaming buffer to settle.
-
 ```bash
-# Latest price for a stock
-python query.py --name AAPL --latest
-
-# Price at a specific point in time
-python query.py --name AAPL --time "2026-03-29 12:00:00"
-
-# All stock prices at a point in time
-python query.py --all-at-time "2026-03-29 12:00:00"
+make query ARGS='--name AAPL --latest'
+make query ARGS='--name AAPL --time "2026-03-29 12:05:00"'
+make query ARGS='--all-at-time "2026-03-29 12:05:00"'
 ```
 
 ---
 
 ## Validation
 
-Compares every document in MongoDB against BigQuery row-by-row.
+Compares every document in MongoDB against the latest state in BigQuery.
 
 ```bash
-python validate.py   # exit 0 = OK · exit 1 = MISSING or MISMATCH
+make validate   # exit 0 = all OK · exit 1 = MISSING or MISMATCH
 ```
-
-Wait ~30s after stopping the subscriber before running, to allow BigQuery's streaming buffer to flush.
 
 ---
 
 ## Tear Down
 
 ```bash
-docker compose down -v   # stop MongoDB, remove volumes
+make listener-down       # stop listener container
+make down                # stop MongoDB, remove volumes
 make infra-destroy       # destroy all GCP resources via Terraform
 ```
 
@@ -111,25 +137,25 @@ make infra-destroy       # destroy all GCP resources via Terraform
 ## Troubleshooting
 
 **`PRIMARY not found` on startup**
-MongoDB replica set election takes 10–20s. Wait and retry, or check logs: `docker compose logs mongo-setup`.
+MongoDB replica set election takes 10–20s. Check logs: `docker compose logs mongo-setup`. Wait and re-run `make listener-up`.
 
-**`config.yaml` values not applied**
-You must activate the venv before running bootstrap: `source .venv/bin/activate`. Without it, pyyaml may not be installed and values silently fall back to prompts.
+**`make bootstrap` prompts for login even though you're already logged in**
+Your current Google account doesn't have access to the GCP project in `config.yaml`. Bootstrap detects this and prompts you to log in with the correct account.
 
 **`terraform apply` fails with "already exists"**
-A previous partial run left resources in GCP. Re-running `bash bootstrap.sh` handles this automatically — it imports the existing resource and retries.
+Re-running `make bootstrap` handles this automatically — it imports the existing resource and retries.
 
 **Switching to a new GCP project**
-bootstrap.sh detects the project change, clears the stale Terraform state, and provisions fresh. Just update `gcp.project_id` in `config.yaml` and re-run.
+Update `gcp.project_id` in `config.yaml` and re-run `make bootstrap`. Bootstrap detects the project change, clears stale Terraform state, and provisions fresh.
 
-**`validate.py` reports MISSING rows**
-BigQuery streaming inserts have up to 30s delay. Stop the subscriber, wait 30s, then run `validate.py`.
+**`make validate` reports MISMATCH**
+BigQuery streaming inserts have up to 30s delay. Wait ~30s after the last write and re-run. If your database is updating rapidly the values may legitimately differ between the two reads.
 
-**Resume token stale (`OperationFailure` in listener)**
-The MongoDB oplog rolled past the saved token. The listener handles this automatically: deletes the token and performs a fresh snapshot.
+**Resume token stale after MongoDB restart**
+The listener detects this automatically (`OperationFailure`), deletes the stale token from GCS, and performs a fresh snapshot on the next start.
 
-**`gcloud: No ADC found`**
-Run `gcloud auth application-default login` and retry bootstrap.
+**`exec format error` on Cloud Run**
+The subscriber image was built for the wrong CPU architecture (e.g. ARM64 on an M1 Mac). `make deploy` uses `--platform linux/amd64` to build AMD64 images regardless of host architecture — re-running `make deploy` fixes this.
 
-**`No billing account`**
-Terraform cannot enable GCP APIs without billing. Enable billing on the project at console.cloud.google.com before running bootstrap.
+**No billing account**
+Terraform cannot enable GCP APIs without billing. Enable billing on the project at console.cloud.google.com before running `make bootstrap`.

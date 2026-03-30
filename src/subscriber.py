@@ -7,9 +7,11 @@ so Pub/Sub redelivers them.
 """
 
 import json
+import os
 import signal
 import threading
 import time
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from google.cloud import bigquery, pubsub_v1
 
@@ -109,7 +111,27 @@ def timer_loop() -> None:
                 flush()
 
 
+def _start_health_server() -> None:
+    """Start a minimal HTTP server so Cloud Run health checks pass.
+
+    Cloud Run requires every container to listen on PORT (default 8080).
+    This runs in a daemon thread — it doesn't affect the Pub/Sub pull loop.
+    """
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"OK")
+        def log_message(self, *args):
+            pass  # suppress access logs
+
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(("", port), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
+
 def main() -> None:
+    _start_health_server()
     print(f"Subscriber starting ...")
     print(f"  Project      : {config.GCP_PROJECT_ID}")
     print(f"  Subscription : {config.PUBSUB_SUBSCRIPTION}")

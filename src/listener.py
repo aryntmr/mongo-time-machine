@@ -1,4 +1,6 @@
 import json
+import signal
+import sys
 import time
 import uuid
 from datetime import datetime, timezone
@@ -254,6 +256,10 @@ def _consume_stream(stream, snapshot_time, pipeline_id, started_at, state):
 
 
 def main() -> None:
+    # Ensure docker stop (SIGTERM) triggers the finally block to save the resume token.
+    # Python's default SIGTERM handling terminates the process without running finally.
+    signal.signal(signal.SIGTERM, lambda _s, _f: sys.exit(0))
+
     pipeline_id = str(uuid.uuid4())
     started_at = utcnow_iso()
     snapshot_time = None
@@ -271,22 +277,19 @@ def main() -> None:
     saved_token = load_resume_token()
 
     try:
-        stream_ctx, snapshot_time = _open_stream(saved_token, pipeline_id, started_at)
-
-        # collection.watch() is lazy — OperationFailure for a stale token fires
-        # on first iteration, not on watch(). Wrap with __enter__ to detect it.
-        with stream_ctx as stream:
-            try:
+        try:
+            stream_ctx, snapshot_time = _open_stream(saved_token, pipeline_id, started_at)
+            with stream_ctx as stream:
                 _consume_stream(stream, snapshot_time, pipeline_id, started_at, state)
-            except OperationFailure:
-                if not saved_token:
-                    raise  # not a stale-token issue, re-raise
-                print("  [WARN] Saved token is stale (oplog rolled past). Falling back to fresh snapshot.")
-                delete_resume_token()
+        except OperationFailure:
+            if not saved_token:
+                raise  # not a stale-token issue, re-raise
+            print("  [WARN] Saved token is stale (oplog rolled past). Falling back to fresh snapshot.")
+            delete_resume_token()
 
-                stream_ctx2, snapshot_time = _open_stream(None, pipeline_id, started_at)
-                with stream_ctx2 as stream2:
-                    _consume_stream(stream2, snapshot_time, pipeline_id, started_at, state)
+            stream_ctx2, snapshot_time = _open_stream(None, pipeline_id, started_at)
+            with stream_ctx2 as stream2:
+                _consume_stream(stream2, snapshot_time, pipeline_id, started_at, state)
 
     except KeyboardInterrupt:
         print("\nListener stopped.")

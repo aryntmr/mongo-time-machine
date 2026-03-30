@@ -57,20 +57,23 @@ print('' if c is None else str(c).lower() if isinstance(c, bool) else c)
 
 log "Checking gcloud CLI ..."
 if ! command -v gcloud &>/dev/null; then
-  die "gcloud CLI not found. Install it from https://cloud.google.com/sdk/docs/install then re-run this script."
+  die "gcloud CLI not found. Run this script via 'make bootstrap' (uses the tools container)."
 fi
 info "Found: $(gcloud version 2>/dev/null | head -1)"
 
 # ── 2. authenticate ────────────────────────────────────────────────────────────
+# --no-launch-browser: prints a URL instead of trying to open a browser.
+# Works in Docker containers and SSH sessions. Credentials are written to
+# ~/.config/gcloud which is volume-mounted and persists across container runs.
 
 log "Checking GCP authentication ..."
 ACTIVE_ACCOUNT=$(gcloud auth list --filter=status:ACTIVE --format="value(account)" 2>/dev/null | head -1)
 
 if [[ -z "${ACTIVE_ACCOUNT}" ]]; then
-  info "No active account found. Opening browser for login ..."
-  gcloud auth login
+  info "No active account found. Follow the link below to authenticate."
+  gcloud auth login --no-launch-browser
   ACTIVE_ACCOUNT=$(gcloud auth list --filter=status:ACTIVE --format="value(account)" 2>/dev/null | head -1)
-  [[ -z "${ACTIVE_ACCOUNT}" ]] && die "Authentication failed. Run 'gcloud auth login' manually and retry."
+  [[ -z "${ACTIVE_ACCOUNT}" ]] && die "Authentication failed. Re-run 'make bootstrap'."
 fi
 info "Authenticated as: ${ACTIVE_ACCOUNT}"
 
@@ -81,8 +84,8 @@ info "Authenticated as: ${ACTIVE_ACCOUNT}"
 
 log "Checking Application Default Credentials (ADC) ..."
 if ! gcloud auth application-default print-access-token &>/dev/null; then
-  info "No ADC found. Opening browser for application-default login ..."
-  gcloud auth application-default login
+  info "No ADC found. Follow the link below to set up Application Default Credentials."
+  gcloud auth application-default login --no-launch-browser
 fi
 info "ADC configured"
 
@@ -145,6 +148,22 @@ fi
 gcloud config set project "${PROJECT_ID}" --quiet
 info "Using project: ${PROJECT_ID}"
 
+# Verify the active account can access this project. If not, re-authenticate.
+# This handles switching to a different GCP account without requiring the user
+# to manually run gcloud auth login first.
+if ! gcloud projects describe "${PROJECT_ID}" --quiet &>/dev/null; then
+  info "Account ${ACTIVE_ACCOUNT} cannot access project ${PROJECT_ID}."
+  info "Please authenticate with the account that owns this project."
+  gcloud auth login --no-launch-browser
+  ACTIVE_ACCOUNT=$(gcloud auth list --filter=status:ACTIVE --format="value(account)" 2>/dev/null | head -1)
+  [[ -z "${ACTIVE_ACCOUNT}" ]] && die "Authentication failed. Re-run 'make bootstrap'."
+  gcloud config set project "${PROJECT_ID}" --quiet
+  info "Authenticated as: ${ACTIVE_ACCOUNT}"
+  # ADC must also be refreshed for the new account — Terraform uses ADC, not gcloud auth.
+  info "Refreshing Application Default Credentials for new account ..."
+  gcloud auth application-default login --no-launch-browser
+fi
+
 REGION="${YAML_REGION:-us-central1}"
 
 # ── 5. enable GCP APIs ─────────────────────────────────────────────────────────
@@ -160,6 +179,12 @@ gcloud services enable iam.googleapis.com --project="${PROJECT_ID}" --quiet
 info "iam.googleapis.com enabled"
 gcloud services enable cloudresourcemanager.googleapis.com --project="${PROJECT_ID}" --quiet
 info "cloudresourcemanager.googleapis.com enabled"
+gcloud services enable artifactregistry.googleapis.com --project="${PROJECT_ID}" --quiet
+info "artifactregistry.googleapis.com enabled"
+gcloud services enable compute.googleapis.com --project="${PROJECT_ID}" --quiet
+info "compute.googleapis.com enabled"
+gcloud services enable run.googleapis.com --project="${PROJECT_ID}" --quiet
+info "run.googleapis.com enabled"
 
 # ── 6. provision GCP resources ─────────────────────────────────────────────────
 
@@ -171,10 +196,13 @@ if command -v terraform &>/dev/null && [[ -f "${INFRA_DIR}/main.tf" ]]; then
 
   # Generate terraform.tfvars from resolved config values.
   cat > "${INFRA_DIR}/terraform.tfvars" <<EOF
-project_id    = "${PROJECT_ID}"
-region        = "${REGION}"
-bq_dataset_id = "stock_history"
-pubsub_topic  = "price-events"
+project_id      = "${PROJECT_ID}"
+region          = "${REGION}"
+bq_dataset_id   = "stock_history"
+pubsub_topic    = "price-events"
+gar_location    = "${REGION}"
+gce_zone        = "${REGION}-a"
+cloudrun_region = "${REGION}"
 EOF
   info "Wrote infra/terraform.tfvars"
 
@@ -224,6 +252,15 @@ except: pass
   PUBSUB_TOPIC=$(terraform -chdir="${INFRA_DIR}" output -raw pubsub_topic)
   PUBSUB_SUB=$(terraform -chdir="${INFRA_DIR}" output -raw pubsub_subscription)
   BQ_DATASET=$(terraform -chdir="${INFRA_DIR}" output -raw bq_dataset)
+
+  # Write the SA key to src/ (running inside tools container, so /workspace = src/).
+  # The local_file Terraform resource cannot write to the host filesystem correctly
+  # when Terraform runs inside a container with different volume mount paths.
+  log "Writing service account key ..."
+  terraform -chdir="${INFRA_DIR}" output -raw service_account_key_json > service-account-key.json
+  chmod 600 service-account-key.json
+  info "service-account-key.json written"
+
   info "Terraform apply complete"
   USE_TERRAFORM=true
 else
@@ -253,6 +290,9 @@ set_env_var "PUBSUB_TOPIC"                   "${PUBSUB_TOPIC}"
 set_env_var "PUBSUB_SUBSCRIPTION"            "${PUBSUB_SUB}"
 set_env_var "GCS_BUCKET"                     "${GCS_BUCKET}"
 set_env_var "GCS_RESUME_TOKEN_PATH"          "resume_token.txt"
+set_env_var "GAR_LOCATION"                   "${REGION}"
+set_env_var "GCE_ZONE"                       "${REGION}-a"
+set_env_var "CLOUDRUN_REGION"                "${REGION}"
 
 # MongoDB vars — written only if config.yaml provided real values (not placeholders).
 # This avoids overwriting a hand-edited .env on re-runs.
@@ -280,35 +320,26 @@ fi
 
 info ".env updated"
 
-# ── 8. install Python dependencies ─────────────────────────────────────────────
-
-log "Installing Python dependencies ..."
-PYTHON=$(command -v python3 || command -v python || true)
-[[ -z "${PYTHON}" ]] && die "python not found. Activate your venv first: source .venv/bin/activate"
-if [[ -z "${VIRTUAL_ENV:-}" ]]; then
-  die "No virtual environment active. Run: python3 -m venv .venv && source .venv/bin/activate — then re-run this script."
-fi
-"${PYTHON}" -m pip install -r requirements.txt --quiet
-info "Dependencies installed"
-
-# ── done ───────────────────────────────────────────────────────────────────────
+# ── 8. done ────────────────────────────────────────────────────────────────────
+# Python dependencies are pre-installed in the tools container image.
+# No pip install step needed here.
 
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "  Setup complete."
+echo "  GCP infra provisioned."
+echo ""
+echo "  Next steps:"
+echo "    1. Set MONGO_URI in .env to point at your MongoDB replica set"
+echo "    2. make deploy         # build + push subscriber → Cloud Run"
+echo "    3. make up             # start local MongoDB"
+echo "    4. make listener-up    # start listener container"
+echo "    5. make simulate       # generate price updates"
+echo ""
+echo "  Observe:"
+echo "    make validate          # MongoDB == BigQuery?"
+echo "    make query ARGS='--name AAPL --latest'"
 echo ""
 if [[ "${USE_TERRAFORM}" == "true" ]]; then
-  echo "  To tear down GCP resources:  make infra-destroy"
+  echo "  Tear down GCP resources:  make infra-destroy"
 fi
-echo ""
-echo "  To run the pipeline:"
-echo "    make up                               # start MongoDB replica set"
-echo "    make subscribe                        # terminal 1 — Pub/Sub to BigQuery"
-echo "    make listen                           # terminal 2 — CDC to Pub/Sub"
-echo "    make simulate                         # terminal 3 — price updates"
-echo ""
-echo "  To query BigQuery:"
-echo "    python query.py --name AAPL --latest"
-echo "    python query.py --name AAPL --time '2026-03-29 12:00:00'"
-echo "    python query.py --all-at-time '2026-03-29 12:00:00'"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

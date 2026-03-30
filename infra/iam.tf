@@ -11,6 +11,7 @@ locals {
     "roles/pubsub.publisher",
     "roles/pubsub.subscriber",
     "roles/storage.objectAdmin",
+    "roles/artifactregistry.reader", # pull images from GAR on GCE and Cloud Run
   ])
 }
 
@@ -46,12 +47,4 @@ resource "google_pubsub_subscription_iam_member" "dead_letter_subscriber" {
 # ── Service account key ────────────────────────────────────────────────────────
 resource "google_service_account_key" "pipeline" {
   service_account_id = google_service_account.pipeline.name
-}
-
-# Write the decoded JSON key directly into src/ so Python scripts can find it
-# via GOOGLE_APPLICATION_CREDENTIALS=./service-account-key.json.
-resource "local_file" "service_account_key" {
-  content         = base64decode(google_service_account_key.pipeline.private_key)
-  filename        = "${path.module}/../src/service-account-key.json"
-  file_permission = "0600"
 }

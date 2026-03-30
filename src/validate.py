@@ -30,7 +30,7 @@ def main() -> None:
     sql = f"""
         SELECT name, price
         FROM {table}
-        QUALIFY ROW_NUMBER() OVER (PARTITION BY name ORDER BY timestamp DESC) = 1
+        QUALIFY ROW_NUMBER() OVER (PARTITION BY name ORDER BY timestamp DESC, ingested_at DESC) = 1
     """
     bq_rows = list(bq_client.query(sql).result())
     bq_prices = {row["name"]: float(row["price"]) for row in bq_rows}

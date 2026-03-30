@@ -20,3 +20,21 @@ variable "pubsub_topic" {
   type        = string
   default     = "price-events"
 }
+
+variable "gar_location" {
+  description = "Artifact Registry location — must be a single region (e.g. us-central1)"
+  type        = string
+  default     = "us-central1"
+}
+
+variable "gce_zone" {
+  description = "GCE zone for the listener VM (e.g. us-central1-a)"
+  type        = string
+  default     = "us-central1-a"
+}
+
+variable "cloudrun_region" {
+  description = "Cloud Run region for the subscriber service"
+  type        = string
+  default     = "us-central1"
+}

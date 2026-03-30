@@ -9,15 +9,17 @@ MongoDB → Pub/Sub → BigQuery CDC pipeline with point-in-time stock price que
 ## Architecture
 
 ```
-simulator.py  →  MongoDB replica set (Docker)
-                      │
+[Your app / simulator.py]  →  MongoDB replica set
+                                      │
+                          listener.py (Docker container, local machine)
+                                      │
                       ├─ no saved token: snapshot → Pub/Sub, then change stream
                       └─ saved token: resume change stream from token
-                                │
+                                      │
                            Pub/Sub (60s ack deadline, 7-day retention, dead letter after 5 fails)
-                                │
-                          subscriber.py (micro-batch: 500 msgs or 2s → insert_rows_json)
-                                │
+                                      │
+                          subscriber.py (Cloud Run, min 1 / max 10 instances)
+                                      │
                            BigQuery — price_history (deduped at query time by event_id)
 
 listener.py  →  pipeline_metadata (direct BQ writes)
@@ -33,30 +35,38 @@ validate.py  →  MongoDB vs BigQuery comparison (OK / MISSING / MISMATCH)
 
 ```
 infra/
-├── main.tf            # Terraform provider config
-├── variables.tf       # input variables (project_id, region, etc.)
-├── outputs.tf         # outputs captured by bootstrap.sh into .env
-├── bigquery.tf        # BQ dataset + price_history + pipeline_metadata tables
-├── pubsub.tf          # price-events topic + dead-letter topic + subscription
-├── storage.tf         # GCS bucket for resume tokens (versioned, force_destroy)
-├── iam.tf             # service account, 5 IAM roles, SA key → src/service-account-key.json
-└── terraform.tfvars.example  # template (committed); terraform.tfvars is gitignored
+├── main.tf                   # Terraform provider config
+├── variables.tf               # input variables (project_id, region, gar_location, gce_zone, cloudrun_region)
+├── outputs.tf                 # outputs captured by bootstrap.sh into .env + service_account_key_json
+├── bigquery.tf                # BQ dataset + price_history + pipeline_metadata tables
+├── pubsub.tf                  # price-events topic + dead-letter topic + subscription
+├── storage.tf                 # GCS bucket for resume tokens (versioned, force_destroy)
+├── iam.tf                     # service account, 6 IAM roles, SA key resource (key JSON exposed via output)
+├── artifact_registry.tf       # GAR repository vali-pipeline (keep last 10 tags)
+├── compute.tf                 # GCE vali-listener (optional, production only)
+├── cloudrun.tf                # Cloud Run vali-subscriber (min 1 / max 10, placeholder image)
+└── terraform.tfvars.example   # template (committed); terraform.tfvars is gitignored
 
 src/
-├── config.py          # env vars + get_mongo_client()
-├── simulator.py       # random price updates to MongoDB
-├── listener.py        # snapshot + change stream → Pub/Sub; metadata → BQ; token → GCS
-├── subscriber.py      # Pub/Sub → BigQuery micro-batch writer
-├── query.py           # CLI: --latest, --time, --all-at-time (with dedup CTE + retry)
-├── validate.py        # MongoDB vs BigQuery integrity check
-├── bootstrap.sh       # one-command setup: reads config.yaml → Terraform → .env
-├── setup_gcp.sh       # fallback provisioning (used when Terraform not installed)
-├── config.yaml.example  # user-facing config template (committed); config.yaml is gitignored
-├── docker-compose.yml # 3-node MongoDB replica set
-├── mongo-init/init.sh # rs.initiate() + seeds 5 stocks
+├── config.py               # env vars + get_mongo_client()
+├── simulator.py            # random price updates to MongoDB (dev/testing only)
+├── listener.py             # snapshot + change stream → Pub/Sub; metadata → BQ; token → GCS
+├── subscriber.py           # Pub/Sub → BigQuery micro-batch writer + HTTP health check for Cloud Run
+├── query.py                # CLI: --latest, --time, --all-at-time (with dedup CTE + retry)
+├── validate.py             # MongoDB vs BigQuery integrity check
+├── bootstrap.sh            # one-command setup: reads config.yaml → Terraform → .env → SA key
+├── deploy.sh               # build linux/amd64 images → push to GAR → deploy Cloud Run
+├── setup_gcp.sh            # fallback provisioning (used when Terraform not installed)
+├── Dockerfile.listener     # listener image (python:3.11-slim, non-root)
+├── Dockerfile.subscriber   # subscriber image (python:3.11-slim, non-root)
+├── Dockerfile.tools        # tools image (gcloud + Terraform + Docker CLI + buildx + Python)
+├── .dockerignore           # excludes .env, *.json, __pycache__ from build context
+├── config.yaml.example     # user-facing config template (committed); config.yaml is gitignored
+├── docker-compose.yml      # 3-node MongoDB replica set + listener + subscriber + tools profiles
+├── mongo-init/init.sh      # rs.initiate() + seeds 5 stocks
 ├── requirements.txt
-├── .env.example       # committed template
-├── .env               # never commit
+├── .env.example            # committed template
+├── .env                    # never commit
 └── Makefile
 ```
 
@@ -92,7 +102,7 @@ Append-only. Partitioned by `DATE(started_at)`. Read with `ORDER BY ... DESC LIM
 
 ## Key Things to Know
 
-**`config.get_mongo_client()`** — always use this, never `pymongo.MongoClient` directly. On macOS, `host.docker.internal` may be missing; the function falls back to scanning `localhost:27017/18/19` with `directConnection=true` to find the PRIMARY.
+**`config.get_mongo_client()`** — always use this, never `pymongo.MongoClient` directly. On macOS, `host.docker.internal` may be missing; the function falls back to scanning `localhost:27017/18/19` with `directConnection=true` to find the PRIMARY. This fallback only fires when `MONGO_URI` is the hardcoded default — if `.env` is populated (normal operation), the fallback is never reached.
 
 **PRIMARY is non-deterministic** — any of the 3 nodes can win election. Never assume port 27017 is primary.
 
@@ -129,10 +139,10 @@ Append-only. Partitioned by `DATE(started_at)`. Read with `ORDER BY ... DESC LIM
 | `MONGO_URI` | `mongodb://host.docker.internal:27017,.../?replicaSet=rs0` | Replica set URI |
 | `DB_NAME` | `stockdb` | Database |
 | `COLLECTION` | `stocks` | Collection |
-| `UPDATE_INTERVAL` | `1.0` | Seconds between simulator updates |
-| `BURSTY_MODE` | `false` | Random sleep if true |
-| `BURSTY_MIN` | `0.1` | Bursty min sleep (s) |
-| `BURSTY_MAX` | `3.0` | Bursty max sleep (s) |
+| `UPDATE_INTERVAL` | `1.0` | Seconds between simulator updates (simulator only) |
+| `BURSTY_MODE` | `false` | Random sleep if true (simulator only) |
+| `BURSTY_MIN` | `0.1` | Bursty min sleep (s) (simulator only) |
+| `BURSTY_MAX` | `3.0` | Bursty max sleep (s) (simulator only) |
 | `GOOGLE_APPLICATION_CREDENTIALS` | `./service-account-key.json` | GCP service account key path |
 | `GCP_PROJECT_ID` | — | GCP project ID |
 | `BQ_DATASET` | `stock_history` | BigQuery dataset |
@@ -142,6 +152,9 @@ Append-only. Partitioned by `DATE(started_at)`. Read with `ORDER BY ... DESC LIM
 | `PUBSUB_SUBSCRIPTION` | `price-events-sub` | Pub/Sub pull subscription |
 | `GCS_BUCKET` | — | GCS bucket for resume token |
 | `GCS_RESUME_TOKEN_PATH` | `resume_token.txt` | Object path within bucket |
+| `GAR_LOCATION` | `us-central1` | Artifact Registry region |
+| `GCE_ZONE` | `us-central1-a` | GCE zone (optional GCE listener deployment) |
+| `CLOUDRUN_REGION` | `us-central1` | Cloud Run region |
 
 ---
 
@@ -150,56 +163,62 @@ Append-only. Partitioned by `DATE(started_at)`. Read with `ORDER BY ... DESC LIM
 ```bash
 cd src
 
-# First-time setup
-python3 -m venv .venv && source .venv/bin/activate
-gcloud auth login
-gcloud auth application-default login
+# First-time setup (Docker Desktop is the only prerequisite)
 cp config.yaml.example config.yaml   # fill in gcp.project_id + mongodb fields
-bash bootstrap.sh                    # provisions GCP + writes .env
+make bootstrap                        # provisions GCP infra + writes .env + SA key
+make deploy                           # builds AMD64 subscriber image → GAR → Cloud Run
 
-# Start MongoDB replica set
-docker compose up -d
-docker compose logs mongo-setup   # wait for: PRIMARY elected + Seeded 5 stocks
+# Start local MongoDB (skip if using your own MongoDB)
+make up
 
-# Terminal 1 — subscriber (start before listener)
-source .venv/bin/activate && python subscriber.py
+# Start listener
+make listener-up
 
-# Terminal 2 — listener
-source .venv/bin/activate && python listener.py
+# Optional: run simulator against local MongoDB
+make simulate
 
-# Terminal 3 — simulator
-source .venv/bin/activate && python simulator.py
-
-# Query (wait ~30s after stopping subscriber for BQ streaming delay)
-python query.py --name AAPL --latest
-python query.py --name AAPL --time "2026-03-29 12:00:00"
-python query.py --all-at-time "2026-03-29 12:00:00"
+# Query (wait ~30s after starting pipeline for BQ streaming buffer)
+make query ARGS='--name AAPL --latest'
+make query ARGS='--name AAPL --time "2026-03-29 12:00:00"'
+make query ARGS='--all-at-time "2026-03-29 12:00:00"'
 
 # Validate
-python validate.py   # exit 0 = OK, exit 1 = MISSING or MISMATCH
+make validate   # exit 0 = OK, exit 1 = MISSING or MISMATCH
 
 # Tear down
-docker compose down -v
-make infra-destroy   # removes all GCP resources via Terraform
+make listener-down
+make down                # stop MongoDB, remove volumes
+make infra-destroy       # removes all GCP resources via Terraform
 ```
 
 ---
 
 ## Infrastructure (Terraform)
 
-All GCP resources are defined in `infra/` and provisioned by `bootstrap.sh`.
+All GCP resources are defined in `infra/` and provisioned by `bootstrap.sh`. All tooling runs inside the tools container — Docker Desktop is the only host prerequisite.
 
 **Resources created:**
 - BigQuery dataset `stock_history` + tables `price_history` and `pipeline_metadata`
 - Pub/Sub topic `price-events` + dead-letter topic + subscription `price-events-sub`
 - GCS bucket `{project_id}-cdc-resume-tokens` (versioned, force_destroy enabled)
-- Service account `vali-pipeline` with roles: `bigquery.dataEditor`, `bigquery.jobUser`, `pubsub.publisher`, `pubsub.subscriber`, `storage.objectAdmin`
-- SA key written to `src/service-account-key.json` (0600 permissions)
+- Artifact Registry repository `vali-pipeline` (keep last 10 image tags)
+- Cloud Run service `vali-subscriber` (min 1 / max 10 instances, placeholder image on first apply)
+- GCE instance `vali-listener` (optional, production only — listener runs locally by default)
+- Service account `vali-pipeline` with roles: `bigquery.dataEditor`, `bigquery.jobUser`, `pubsub.publisher`, `pubsub.subscriber`, `storage.objectAdmin`, `artifactregistry.reader`
+- SA key extracted from Terraform output and written to `src/service-account-key.json` by `bootstrap.sh`
 
 **bootstrap.sh behaviour:**
 - Reads `config.yaml` → writes `infra/terraform.tfvars` + `src/.env`
+- Detects if active gcloud account can't access the project → re-authenticates inline
 - Detects project change in Terraform state and clears it automatically
 - Imports pre-existing GCS bucket on re-runs to avoid 409 conflicts
+- Extracts SA key via `terraform output -raw service_account_key_json` → writes `service-account-key.json`
 - Falls back to `setup_gcp.sh` if Terraform is not installed
 
-**Makefile targets:** `infra-init`, `infra-plan`, `infra-apply`, `infra-destroy`
+**deploy.sh behaviour:**
+- Default: subscriber to Cloud Run only (listener runs locally)
+- `--listener-only`: listener to GCE only
+- `--all`: both
+- Builds images with `docker buildx build --platform linux/amd64` (cross-compiles AMD64 on M1/M2 Macs)
+
+**Makefile targets:** `bootstrap`, `deploy`, `deploy-subscriber`, `deploy-listener`, `up`, `down`, `listener-up`, `listener-down`, `pipeline-up`, `pipeline-down`, `simulate`, `validate`, `query`, `infra-init`, `infra-plan`, `infra-apply`, `infra-destroy`

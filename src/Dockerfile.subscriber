@@ -1,0 +1,18 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Disable Python output buffering so logs appear immediately in docker logs
+ENV PYTHONUNBUFFERED=1
+
+# Install dependencies first — cached separately from source changes
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Source only — no .env, no service-account-key.json
+COPY config.py subscriber.py ./
+
+RUN useradd --uid 1000 --no-create-home appuser
+USER appuser
+
+ENTRYPOINT ["python", "subscriber.py"]

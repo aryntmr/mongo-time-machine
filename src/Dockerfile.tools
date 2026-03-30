@@ -1,0 +1,53 @@
+# Dockerfile.tools — pipeline tooling image
+#
+# Contains everything needed to provision and operate the pipeline.
+# Jason's only prerequisite is Docker Desktop.
+#
+# Includes:
+#   - gcloud CLI  (from base image)
+#   - Terraform   (HashiCorp apt repo)
+#   - Docker CLI  (to build + push images from within the container via socket mount)
+#   - Python 3 + project dependencies (for simulator, query, validate)
+
+FROM google/cloud-sdk:slim
+
+# ── Terraform ─────────────────────────────────────────────────────────────────
+
+RUN apt-get update -qq && \
+    apt-get install -y --no-install-recommends gnupg lsb-release wget && \
+    wget -qO- https://apt.releases.hashicorp.com/gpg | \
+      gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg && \
+    echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] \
+      https://apt.releases.hashicorp.com $(lsb_release -cs) main" \
+      > /etc/apt/sources.list.d/hashicorp.list && \
+    apt-get update -qq && \
+    apt-get install -y --no-install-recommends terraform && \
+    rm -rf /var/lib/apt/lists/*
+
+# ── Docker CLI + Python venv support ──────────────────────────────────────────
+# Install Docker CLI from Docker's official repo (newer than Debian's docker.io).
+# CLI only — the daemon runs on the host (socket-mounted at runtime).
+# python3-venv — needed to create an isolated venv for project deps.
+
+RUN apt-get update -qq && \
+    apt-get install -y --no-install-recommends ca-certificates curl python3-venv && \
+    install -m 0755 -d /etc/apt/keyrings && \
+    curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc && \
+    chmod a+r /etc/apt/keyrings/docker.asc && \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] \
+      https://download.docker.com/linux/debian $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
+      > /etc/apt/sources.list.d/docker.list && \
+    apt-get update -qq && \
+    apt-get install -y --no-install-recommends docker-ce-cli docker-buildx-plugin && \
+    rm -rf /var/lib/apt/lists/*
+
+# ── Python project dependencies ───────────────────────────────────────────────
+# Use a venv so project packages don't conflict with system Python packages.
+
+RUN python3 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+COPY requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
+
+WORKDIR /workspace
