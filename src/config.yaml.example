@@ -1,0 +1,32 @@
+# Vali Health CDC Pipeline — Configuration Template
+#
+# Usage:
+#   cp config.yaml.example config.yaml
+#   # Fill in every <PLACEHOLDER> below
+#   bash bootstrap.sh
+#
+# bootstrap.sh reads this file to:
+#   1. Generate infra/terraform.tfvars  (used by Terraform to provision GCP)
+#   2. Populate src/.env               (read by Python scripts at runtime)
+
+# ── GCP ────────────────────────────────────────────────────────────────────────
+gcp:
+  project_id: <GCP_PROJECT_ID>     # e.g. my-project-123456
+  region: us-central1              # GCP region (affects provider; BQ/Pub/Sub are multi-region)
+
+# ── MongoDB ────────────────────────────────────────────────────────────────────
+mongodb:
+  connection_string: <MONGODB_CONNECTION_STRING>
+  # Local Docker replica set (default):
+  #   mongodb://host.docker.internal:27017,host.docker.internal:27018,host.docker.internal:27019/?replicaSet=rs0
+  # MongoDB Atlas:
+  #   mongodb+srv://<user>:<pass>@<cluster>.mongodb.net/?replicaSet=atlas-xxx
+  database: <DATABASE_NAME>        # e.g. stockdb
+  collection: <COLLECTION_NAME>    # e.g. stocks
+
+# ── Pipeline tuning (optional) ─────────────────────────────────────────────────
+pipeline:
+  update_interval: 1.0   # seconds between simulator updates (fixed mode)
+  bursty_mode: false     # true = random sleep between bursty_min and bursty_max
+  bursty_min: 0.1
+  bursty_max: 3.0

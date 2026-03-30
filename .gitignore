@@ -1,0 +1,6 @@
+# Terraform state and provider cache — never commit
+infra/.terraform/
+infra/*.tfstate
+infra/*.tfstate.*
+infra/.terraform.lock.hcl
+infra/terraform.tfvars

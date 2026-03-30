@@ -1,4 +1,5 @@
 .env
+config.yaml
 service-account-key.json
 __pycache__/
 *.pyc

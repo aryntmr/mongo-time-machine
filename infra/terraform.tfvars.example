@@ -1,0 +1,7 @@
+# Copy this file to terraform.tfvars and fill in your values.
+# Or use bootstrap.sh — it generates terraform.tfvars from config.yaml automatically.
+
+project_id    = "<GCP_PROJECT_ID>"
+region        = "us-central1"
+bq_dataset_id = "stock_history"
+pubsub_topic  = "price-events"
