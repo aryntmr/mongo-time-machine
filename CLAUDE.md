@@ -32,6 +32,16 @@ validate.py  →  MongoDB vs BigQuery comparison (OK / MISSING / MISMATCH)
 ## File Structure
 
 ```
+infra/
+├── main.tf            # Terraform provider config
+├── variables.tf       # input variables (project_id, region, etc.)
+├── outputs.tf         # outputs captured by bootstrap.sh into .env
+├── bigquery.tf        # BQ dataset + price_history + pipeline_metadata tables
+├── pubsub.tf          # price-events topic + dead-letter topic + subscription
+├── storage.tf         # GCS bucket for resume tokens (versioned, force_destroy)
+├── iam.tf             # service account, 5 IAM roles, SA key → src/service-account-key.json
+└── terraform.tfvars.example  # template (committed); terraform.tfvars is gitignored
+
 src/
 ├── config.py          # env vars + get_mongo_client()
 ├── simulator.py       # random price updates to MongoDB
@@ -39,8 +49,9 @@ src/
 ├── subscriber.py      # Pub/Sub → BigQuery micro-batch writer
 ├── query.py           # CLI: --latest, --time, --all-at-time (with dedup CTE + retry)
 ├── validate.py        # MongoDB vs BigQuery integrity check
-├── bootstrap.sh       # one-command GCP + Python setup
-├── setup_gcp.sh       # provisions IAM, BQ, Pub/Sub, GCS
+├── bootstrap.sh       # one-command setup: reads config.yaml → Terraform → .env
+├── setup_gcp.sh       # fallback provisioning (used when Terraform not installed)
+├── config.yaml.example  # user-facing config template (committed); config.yaml is gitignored
 ├── docker-compose.yml # 3-node MongoDB replica set
 ├── mongo-init/init.sh # rs.initiate() + seeds 5 stocks
 ├── requirements.txt
@@ -142,7 +153,9 @@ cd src
 # First-time setup
 python3 -m venv .venv && source .venv/bin/activate
 gcloud auth login
-bash bootstrap.sh <gcp-project-id>
+gcloud auth application-default login
+cp config.yaml.example config.yaml   # fill in gcp.project_id + mongodb fields
+bash bootstrap.sh                    # provisions GCP + writes .env
 
 # Start MongoDB replica set
 docker compose up -d
@@ -167,4 +180,26 @@ python validate.py   # exit 0 = OK, exit 1 = MISSING or MISMATCH
 
 # Tear down
 docker compose down -v
+make infra-destroy   # removes all GCP resources via Terraform
 ```
+
+---
+
+## Infrastructure (Terraform)
+
+All GCP resources are defined in `infra/` and provisioned by `bootstrap.sh`.
+
+**Resources created:**
+- BigQuery dataset `stock_history` + tables `price_history` and `pipeline_metadata`
+- Pub/Sub topic `price-events` + dead-letter topic + subscription `price-events-sub`
+- GCS bucket `{project_id}-cdc-resume-tokens` (versioned, force_destroy enabled)
+- Service account `vali-pipeline` with roles: `bigquery.dataEditor`, `bigquery.jobUser`, `pubsub.publisher`, `pubsub.subscriber`, `storage.objectAdmin`
+- SA key written to `src/service-account-key.json` (0600 permissions)
+
+**bootstrap.sh behaviour:**
+- Reads `config.yaml` → writes `infra/terraform.tfvars` + `src/.env`
+- Detects project change in Terraform state and clears it automatically
+- Imports pre-existing GCS bucket on re-runs to avoid 409 conflicts
+- Falls back to `setup_gcp.sh` if Terraform is not installed
+
+**Makefile targets:** `infra-init`, `infra-plan`, `infra-apply`, `infra-destroy`
