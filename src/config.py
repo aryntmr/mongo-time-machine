@@ -19,6 +19,14 @@ BQ_TABLE          = os.getenv("BQ_TABLE", "price_history")
 BQ_METADATA_TABLE = os.getenv("BQ_METADATA_TABLE", "pipeline_metadata")
 # GOOGLE_APPLICATION_CREDENTIALS is read automatically by the BigQuery client
 
+# Pub/Sub
+PUBSUB_TOPIC        = os.getenv("PUBSUB_TOPIC", "price-events")
+PUBSUB_SUBSCRIPTION = os.getenv("PUBSUB_SUBSCRIPTION", "price-events-sub")
+
+# GCS (resume token persistence)
+GCS_BUCKET            = os.getenv("GCS_BUCKET", "")
+GCS_RESUME_TOKEN_PATH = os.getenv("GCS_RESUME_TOKEN_PATH", "resume_token.txt")
+
 
 def get_mongo_client() -> pymongo.MongoClient:
     """Connect to MongoDB.

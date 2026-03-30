@@ -13,6 +13,9 @@ logs:
 listen:
 	python listener.py
 
+subscribe:
+	python subscriber.py
+
 simulate:
 	python simulator.py
 

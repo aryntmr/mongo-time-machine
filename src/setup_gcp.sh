@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Usage: bash setup_gcp.sh <your-gcp-project-id>
-# Creates all GCP resources needed for Version 1 of the pipeline.
+# Creates all GCP resources needed for the pipeline.
 # Run once. Safe to re-run — most gcloud commands are idempotent.
 
 set -euo pipefail
@@ -68,6 +68,57 @@ bq mk --table \
   'pipeline_id:STRING,started_at:TIMESTAMP,snapshot_completed_at:TIMESTAMP,last_event_timestamp:TIMESTAMP,last_resume_token:STRING,status:STRING' \
   2>/dev/null || echo "    (already exists, skipping)"
 
+# 7. Create GCS bucket for resume tokens
+BUCKET="${PROJECT_ID}-cdc-resume-tokens"
+echo "==> Creating GCS bucket gs://${BUCKET} ..."
+gcloud storage buckets create "gs://${BUCKET}" \
+  --project="${PROJECT_ID}" \
+  --location="US" \
+  --uniform-bucket-level-access 2>/dev/null || echo "    (already exists, skipping)"
+
+# 8. Create Pub/Sub topic
+TOPIC="price-events"
+echo "==> Creating Pub/Sub topic ${TOPIC} ..."
+gcloud pubsub topics create "${TOPIC}" \
+  --project="${PROJECT_ID}" 2>/dev/null || echo "    (already exists, skipping)"
+
+# 9. Create dead letter topic
+DLT="price-events-dead-letter"
+echo "==> Creating dead letter topic ${DLT} ..."
+gcloud pubsub topics create "${DLT}" \
+  --project="${PROJECT_ID}" 2>/dev/null || echo "    (already exists, skipping)"
+
+# 10. Create subscription with dead letter policy
+SUB="price-events-sub"
+echo "==> Creating subscription ${SUB} ..."
+gcloud pubsub subscriptions create "${SUB}" \
+  --project="${PROJECT_ID}" \
+  --topic="${TOPIC}" \
+  --ack-deadline=60 \
+  --message-retention-duration=7d \
+  --dead-letter-topic="projects/${PROJECT_ID}/topics/${DLT}" \
+  --max-delivery-attempts=5 2>/dev/null || echo "    (already exists, skipping)"
+
+# 11. Grant Pub/Sub + GCS IAM roles to service account
+echo "==> Granting Pub/Sub and GCS roles ..."
+for ROLE in roles/pubsub.publisher roles/pubsub.subscriber roles/storage.objectAdmin; do
+  gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
+    --member="serviceAccount:${SA_EMAIL}" \
+    --role="${ROLE}" --quiet
+done
+
+# 12. Grant Pub/Sub service agent permissions for dead letter forwarding
+PROJECT_NUMBER=$(gcloud projects describe "${PROJECT_ID}" --format="value(projectNumber)")
+PUBSUB_SA="serviceAccount:service-${PROJECT_NUMBER}@gcp-sa-pubsub.iam.gserviceaccount.com"
+
+gcloud pubsub topics add-iam-policy-binding "${DLT}" \
+  --member="${PUBSUB_SA}" \
+  --role="roles/pubsub.publisher" --quiet
+
+gcloud pubsub subscriptions add-iam-policy-binding "${SUB}" \
+  --member="${PUBSUB_SA}" \
+  --role="roles/pubsub.subscriber" --quiet
+
 echo ""
 echo "Done. Next steps:"
 echo "  1. Add to src/.env:"
@@ -76,5 +127,10 @@ echo "       GCP_PROJECT_ID=${PROJECT_ID}"
 echo "       BQ_DATASET=${DATASET}"
 echo "       BQ_TABLE=${TABLE}"
 echo "       BQ_METADATA_TABLE=${META_TABLE}"
+echo "       PUBSUB_TOPIC=${TOPIC}"
+echo "       PUBSUB_SUBSCRIPTION=${SUB}"
+echo "       GCS_BUCKET=${BUCKET}"
+echo "       GCS_RESUME_TOKEN_PATH=resume_token.txt"
 echo "  2. pip install -r requirements.txt"
-echo "  3. python listener.py"
+echo "  3. python subscriber.py   # terminal 1 — Pub/Sub to BigQuery"
+echo "  4. python listener.py     # terminal 2 — CDC to Pub/Sub"

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# bootstrap.sh — one-command setup for the Vali Health CDC pipeline (Version 1)
+# bootstrap.sh — one-command setup for the Vali Health CDC pipeline
 #
 # Usage:
 #   bash bootstrap.sh [gcp-project-id]
@@ -7,8 +7,8 @@
 # What this does (safe to re-run — all steps are idempotent):
 #   1. Verifies gcloud CLI is installed
 #   2. Authenticates with GCP (opens browser once, skips if already logged in)
-#   3. Enables the BigQuery API on the project
-#   4. Creates GCP resources: service account, IAM roles, BQ dataset + table
+#   3. Enables BigQuery, Pub/Sub, and Storage APIs on the project
+#   4. Creates GCP resources: service account, IAM roles, BQ dataset + tables, Pub/Sub topics + subscription, GCS bucket
 #   5. Writes GCP config vars to .env (never overwrites existing Mongo vars)
 #   6. Installs Python dependencies
 
@@ -74,9 +74,13 @@ info "Using project: ${PROJECT_ID}"
 
 # ── 4. enable BigQuery API ─────────────────────────────────────────────────────
 
-log "Enabling BigQuery API ..."
+log "Enabling GCP APIs ..."
 gcloud services enable bigquery.googleapis.com --project="${PROJECT_ID}" --quiet
 info "bigquery.googleapis.com enabled"
+gcloud services enable pubsub.googleapis.com --project="${PROJECT_ID}" --quiet
+info "pubsub.googleapis.com enabled"
+gcloud services enable storage.googleapis.com --project="${PROJECT_ID}" --quiet
+info "storage.googleapis.com enabled"
 
 # ── 5. provision GCP resources ─────────────────────────────────────────────────
 
@@ -95,6 +99,11 @@ set_env_var "GOOGLE_APPLICATION_CREDENTIALS" "./service-account-key.json"
 set_env_var "GCP_PROJECT_ID"                 "${PROJECT_ID}"
 set_env_var "BQ_DATASET"                     "stock_history"
 set_env_var "BQ_TABLE"                       "price_history"
+set_env_var "BQ_METADATA_TABLE"              "pipeline_metadata"
+set_env_var "PUBSUB_TOPIC"                   "price-events"
+set_env_var "PUBSUB_SUBSCRIPTION"            "price-events-sub"
+set_env_var "GCS_BUCKET"                     "${PROJECT_ID}-cdc-resume-tokens"
+set_env_var "GCS_RESUME_TOKEN_PATH"          "resume_token.txt"
 
 info ".env updated with GCP vars"
 
@@ -114,8 +123,9 @@ echo "  Setup complete."
 echo ""
 echo "  To run the pipeline:"
 echo "    make up                               # start MongoDB replica set"
-echo "    make listen                           # terminal 1 — listener + BQ writes"
-echo "    make simulate                         # terminal 2 — price updates"
+echo "    make subscribe                        # terminal 1 — Pub/Sub to BigQuery"
+echo "    make listen                           # terminal 2 — CDC to Pub/Sub"
+echo "    make simulate                         # terminal 3 — price updates"
 echo ""
 echo "  To query BigQuery:"
 echo "    python query.py --name AAPL --latest"
