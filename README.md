@@ -72,6 +72,7 @@ Starts the listener as a Docker container. It takes a baseline snapshot of your 
 make validate                              # MongoDB == BigQuery?
 make query ARGS='--name AAPL --latest'     # latest price
 make query ARGS='--name AAPL --time "2026-03-29 12:05:30"'   # price at a point in time
+make query ARGS='--name AAPL --time "2026-03-29 12:05:30.500"'  # sub-second precision
 make query ARGS='--all-at-time "2026-03-29 12:05:30"'        # all stocks at a point in time
 ```
 
@@ -109,6 +110,7 @@ Generates random price updates to the local Docker MongoDB. Not needed when conn
 ```bash
 make query ARGS='--name AAPL --latest'
 make query ARGS='--name AAPL --time "2026-03-29 12:05:00"'
+make query ARGS='--name AAPL --time "2026-03-29 12:05:00.500"'   # sub-second precision
 make query ARGS='--all-at-time "2026-03-29 12:05:00"'
 ```
 

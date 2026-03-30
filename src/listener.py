@@ -33,8 +33,22 @@ def bson_ts_to_display(ts: Timestamp) -> str:
 
 
 def bson_ts_to_iso(ts: Timestamp) -> str:
-    """ISO 8601 UTC string for BigQuery TIMESTAMP columns."""
-    return datetime.fromtimestamp(ts.time, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    """ISO 8601 UTC string for BigQuery TIMESTAMP columns (microsecond precision)."""
+    return datetime.fromtimestamp(ts.time, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def walltime_to_iso(wt: datetime) -> str:
+    """ISO 8601 UTC string from a wallTime datetime (ms precision from MongoDB)."""
+    if wt.tzinfo is None:
+        wt = wt.replace(tzinfo=timezone.utc)
+    return wt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def walltime_to_display(wt: datetime, inc: int) -> str:
+    """Human-readable string with ms precision for console output."""
+    if wt.tzinfo is None:
+        wt = wt.replace(tzinfo=timezone.utc)
+    return wt.strftime("%Y-%m-%d %H:%M:%S.") + f"{wt.microsecond // 1000:03d}" + f" (ord={inc})"
 
 
 def utcnow_iso() -> str:
@@ -210,6 +224,7 @@ def _consume_stream(stream, snapshot_time, pipeline_id, started_at, state):
             price = doc.get("price")
 
         cluster_time = event.get("clusterTime")
+        wall_time = event.get("wallTime")  # datetime with ms precision (MongoDB >= 6.0)
         token = event["_id"]["_data"]
 
         # Always advance the resume position for every event we receive,
@@ -218,15 +233,21 @@ def _consume_stream(stream, snapshot_time, pipeline_id, started_at, state):
         # (causing that event to be re-published on the next restart).
         state["last_token"] = token
 
-        ts_str = bson_ts_to_display(cluster_time) if cluster_time else "N/A"
+        if wall_time and cluster_time:
+            ts_str = walltime_to_display(wall_time, cluster_time.inc)
+        elif cluster_time:
+            ts_str = bson_ts_to_display(cluster_time)
+        else:
+            ts_str = "N/A"
         price_str = f"{price:.2f}" if isinstance(price, (int, float)) else "N/A"
         print(f"[{ts_str}]  {op.upper():<8}  name={name:<5}  price={price_str}  token={token}")
 
         if cluster_time and price is not None and name != "N/A":
+            event_timestamp = walltime_to_iso(wall_time) if wall_time else bson_ts_to_iso(cluster_time)
             row = {
                 "name": name,
                 "price": float(price),
-                "timestamp": bson_ts_to_iso(cluster_time),
+                "timestamp": event_timestamp,
                 "operation_type": op,
                 "event_id": token,
                 "ingested_at": utcnow_iso(),
@@ -234,7 +255,7 @@ def _consume_stream(stream, snapshot_time, pipeline_id, started_at, state):
             publish_event(row)
             print(f"  [PUBSUB OK]")
 
-            state["last_event_ts"] = bson_ts_to_iso(cluster_time)
+            state["last_event_ts"] = event_timestamp
             event_count += 1
 
             # Persist pipeline health on first event, then every 10

@@ -35,6 +35,13 @@ TABLE = f"`{config.GCP_PROJECT_ID}.{config.BQ_DATASET}.{config.BQ_TABLE}`"
 META  = f"`{config.GCP_PROJECT_ID}.{config.BQ_DATASET}.{config.BQ_METADATA_TABLE}`"
 
 
+def fmt_timestamp(ts: datetime) -> str:
+    """Format a BigQuery timestamp for display. Shows .NNN only if sub-second."""
+    if ts.microsecond:
+        return ts.strftime("%Y-%m-%d %H:%M:%S") + f".{ts.microsecond // 1000:03d} UTC"
+    return ts.strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
 def bq_query_with_retry(sql: str, job_config=None, max_attempts: int = 5) -> list:
     """Run a BigQuery query, retrying on transient failures with exponential backoff.
 
@@ -71,8 +78,8 @@ def check_data_coverage(target_time: datetime) -> datetime | None:
     snap_time = rows[0]["snapshot_completed_at"]
     if snap_time and target_time < snap_time:
         print(
-            f"WARNING: Requested time {target_time.strftime('%Y-%m-%d %H:%M:%S UTC')} "
-            f"is before earliest data ({snap_time.strftime('%Y-%m-%d %H:%M:%S UTC')}). "
+            f"WARNING: Requested time {fmt_timestamp(target_time)} "
+            f"is before earliest data ({fmt_timestamp(snap_time)}). "
             f"Result may be incomplete."
         )
     return snap_time
@@ -114,14 +121,14 @@ def point_in_time(name: str, target_time: datetime) -> None:
         if snap_time and target_time < snap_time:
             print(
                 f"No data available for {name} before "
-                f"{snap_time.strftime('%Y-%m-%d %H:%M:%S UTC')}. "
-                f"Pipeline data starts at {snap_time.strftime('%Y-%m-%d %H:%M:%S UTC')}."
+                f"{fmt_timestamp(snap_time)}. "
+                f"Pipeline data starts at {fmt_timestamp(snap_time)}."
             )
         else:
             print(f"Stock '{name}' not found.")
         return
     row = rows[0]
-    print(f"{name}  price={row.price:.2f}  as of {row.timestamp.strftime('%Y-%m-%d %H:%M:%S UTC')}")
+    print(f"{name}  price={row.price:.2f}  as of {fmt_timestamp(row.timestamp)}")
 
 
 def latest(name: str) -> None:
@@ -154,7 +161,7 @@ def latest(name: str) -> None:
         print(f"Stock '{name}' not found.")
         return
     row = rows[0]
-    print(f"{name}  price={row.price:.2f}  as of {row.timestamp.strftime('%Y-%m-%d %H:%M:%S UTC')}")
+    print(f"{name}  price={row.price:.2f}  as of {fmt_timestamp(row.timestamp)}")
 
 
 def all_at_time(target_time: datetime) -> None:
@@ -190,26 +197,32 @@ def all_at_time(target_time: datetime) -> None:
     )
     rows = bq_query_with_retry(sql, job_config)
     if not rows:
-        print(f"No stocks found at or before {target_time.strftime('%Y-%m-%d %H:%M:%S UTC')}.")
+        print(f"No stocks found at or before {fmt_timestamp(target_time)}.")
         return
     for row in rows:
-        print(f"{row.name:<6}  price={row.price:.2f}  as of {row.timestamp.strftime('%Y-%m-%d %H:%M:%S UTC')}")
+        print(f"{row.name:<6}  price={row.price:.2f}  as of {fmt_timestamp(row.timestamp)}")
 
 
 def parse_time(s: str) -> datetime:
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
+    for fmt in (
+        "%Y-%m-%d %H:%M:%S.%f",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S.%f",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d",
+    ):
         try:
             return datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
         except ValueError:
             pass
-    raise argparse.ArgumentTypeError(f"Cannot parse time: {s!r}. Use 'YYYY-MM-DD HH:MM:SS'")
+    raise argparse.ArgumentTypeError(f"Cannot parse time: {s!r}. Use 'YYYY-MM-DD HH:MM:SS[.fff]'")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Point-in-time stock price query")
     parser.add_argument("--name", help="Stock name (e.g. AAPL)")
     parser.add_argument("--time", type=parse_time, metavar="TIMESTAMP",
-                        help="Target time in UTC: 'YYYY-MM-DD HH:MM:SS'")
+                        help="Target time in UTC: 'YYYY-MM-DD HH:MM:SS[.fff]'")
     parser.add_argument("--latest", action="store_true", help="Return most recent price for --name")
     parser.add_argument("--all-at-time", type=parse_time, metavar="TIMESTAMP", dest="all_at_time",
                         help="Return price of every stock at this time")

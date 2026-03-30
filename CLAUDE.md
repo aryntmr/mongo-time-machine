@@ -81,7 +81,7 @@ Partitioned by `DATE(timestamp)`, clustered by `name`.
 |--------|------|-------|
 | `name` | STRING | Stock ticker |
 | `price` | FLOAT64 | Price at event time |
-| `timestamp` | TIMESTAMP | MongoDB `clusterTime` — seconds precision |
+| `timestamp` | TIMESTAMP | `wallTime` (ms precision) for stream events; `clusterTime` (seconds) for snapshots |
 | `operation_type` | STRING | `snapshot` / `update` / `insert` / `replace` |
 | `event_id` | STRING | Resume token, or `snapshot-{pipeline_id}-{_id}` |
 | `ingested_at` | TIMESTAMP | Wall clock when subscriber wrote the row |
@@ -112,13 +112,13 @@ Append-only. Partitioned by `DATE(started_at)`. Read with `ORDER BY ... DESC LIM
 
 **Token update ordering** — `state["last_token"] = token` runs unconditionally for every event before the publish block. Prevents a Ctrl+C race where publish succeeds but the token assignment is skipped.
 
-**Pub/Sub ordering not guaranteed** — correctness relies on `ORDER BY timestamp` (MongoDB `clusterTime`), not insertion order.
+**Pub/Sub ordering not guaranteed** — correctness relies on `ORDER BY timestamp` (MongoDB `wallTime`), not insertion order.
 
 **Micro-batching** — up to 500 msgs or 2s, whichever first. Ack after successful BQ write; nack on failure → Pub/Sub redelivers. After 5 failures → dead letter topic.
 
 **Deduplication** — duplicates are allowed into `price_history` (Pub/Sub at-least-once + snapshot/stream overlap). All queries in `query.py` use a CTE: `ROW_NUMBER() OVER (PARTITION BY event_id ORDER BY ingested_at ASC) = 1` to collapse them at read time. Write-time dedup is unreliable due to BQ's 30s streaming buffer delay.
 
-**`clusterTime` precision** — `.time` = Unix seconds, `.inc` = ordinal within that second. Only `.time` stored in BQ. Multiple events in the same second share the same timestamp.
+**Timestamp precision** — change stream events use `wallTime` (server wall clock, millisecond precision). Snapshot events use `clusterTime.time` (seconds precision, stored as `.000000`). The `clusterTime.inc` ordinal is shown in console output but not stored in BQ. Query input accepts optional fractional seconds (e.g., `--time "2026-03-30 12:05:53.427"`).
 
 **`updatedFields` over `fullDocument`** — for `update` ops, use `updateDescription.updatedFields["price"]`. `fullDocument` comes from `updateLookup` which snapshots the doc *after* the event — a rapid second update can contaminate it.
 
@@ -180,6 +180,7 @@ make simulate
 # Query (wait ~30s after starting pipeline for BQ streaming buffer)
 make query ARGS='--name AAPL --latest'
 make query ARGS='--name AAPL --time "2026-03-29 12:00:00"'
+make query ARGS='--name AAPL --time "2026-03-29 12:00:00.500"'   # sub-second precision
 make query ARGS='--all-at-time "2026-03-29 12:00:00"'
 
 # Validate
